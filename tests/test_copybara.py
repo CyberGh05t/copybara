@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from downloader import (
+from copybara import (
     download_comment_files,
     download_post_media,
     extract_links,

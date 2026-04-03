@@ -1,15 +1,13 @@
 # Environment
 .env
-venv/
+venv
 
 # Telegram session (contains auth keys — never commit)
 *.session
 *.session-journal
 
-# Downloaded content
+# Downloaded content (logs and index live inside downloads/, already covered)
 downloads/
-index.json
-downloader.log
 
 # Python
 __pycache__/
@@ -22,12 +20,10 @@ __pycache__/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Playwright MCP
 .playwright-mcp/
 
 # Pytest
 .pytest_cache/
-
-# Assist
-CLAUDE.md

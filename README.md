@@ -67,10 +67,10 @@ Reads tdata from `TG_TDATA_PATH`, creates `session.session`.
 ## Usage
 
 ```bash
-python downloader.py
+python copybara.py
 ```
 
-Progress is logged to `downloader.log`.
+Progress is logged to `downloads/copybara.log`.
 
 ## Output Structure
 

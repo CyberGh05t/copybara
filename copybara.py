@@ -23,12 +23,15 @@ from tqdm import tqdm
 
 load_dotenv()
 
+DOWNLOADS_DIR = Path("downloads")
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("downloader.log", encoding="utf-8"),
+        logging.FileHandler(DOWNLOADS_DIR / "copybara.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -39,8 +42,6 @@ PHONE = os.environ.get("TG_PHONE", "")
 CHANNEL = os.environ.get("TG_CHANNEL", "")
 PROXY_HOST = os.environ.get("TG_PROXY_HOST", "")
 PROXY_PORT = int(os.environ.get("TG_PROXY_PORT", 0))
-DOWNLOADS_DIR = Path("downloads")
-INDEX_PATH = Path("index.json")
 SKIP_VIDEO = True  # skip video and voice messages
 
 
@@ -344,8 +345,6 @@ async def process_post(
 
 async def main() -> None:
     """Entry point: authenticate, iterate posts, download."""
-    DOWNLOADS_DIR.mkdir(exist_ok=True)
-
     proxy = (socks.SOCKS5, PROXY_HOST, PROXY_PORT) if PROXY_HOST and PROXY_PORT else None
     client = TelegramClient("session", API_ID, API_HASH, device_model="Desktop",
                             proxy=proxy)
@@ -365,7 +364,15 @@ async def main() -> None:
                 break
         if channel is None:
             channel = await client.get_entity(CHANNEL)
-        log.info("Channel found: %s", getattr(channel, "title", CHANNEL))
+        channel_title = getattr(channel, "title", None) or str(CHANNEL)
+        log.info("Channel found: %s", channel_title)
+
+        # create per-channel download directory
+        channel_slug = make_slug(channel_title)
+        channel_dir = DOWNLOADS_DIR / channel_slug
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        index_path = channel_dir / "index.json"
+        log.info("Download dir: %s", channel_dir)
 
         # get linked discussion group for comment fetching
         discussion_id = None
@@ -386,7 +393,7 @@ async def main() -> None:
                 continue  # skip service messages
             index += 1
             try:
-                await process_post(client, message, index, discussion_id, DOWNLOADS_DIR, INDEX_PATH)
+                await process_post(client, message, index, discussion_id, channel_dir, index_path)
             except ChannelPrivateError:
                 log.error("Channel access denied — subscription expired?")
                 break
