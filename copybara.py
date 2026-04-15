@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import ChannelPrivateError, FileReferenceExpiredError, FloodWaitError
 from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import GetDiscussionMessageRequest
 from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeFilename,
@@ -235,64 +236,127 @@ async def download_post_media(client: TelegramClient, message, folder: Path) -> 
         return filename
 
 
+async def _download_one_comment(
+    client: TelegramClient, comment, folder: Path, discussion_id: int
+) -> dict | None:
+    """Скачать один медиафайл из комментария. Возвращает метаданные или None."""
+    if not comment.media:
+        return None
+    if SKIP_VIDEO and _is_skip_media(comment):
+        log.info("Skipping video in comment %d", comment.id)
+        return None
+    filename = get_media_filename(comment)
+    if not filename:
+        if comment.photo:
+            filename = f"photo_{comment.id}.jpg"
+        elif comment.document:
+            filename = f"document_{comment.id}.bin"
+        else:
+            return None
+    filename = safe_filename(filename, folder, comment.id)
+    dest = str(folder / filename)
+    total_c = getattr(getattr(comment, "document", None), "size", 0) or 0
+    bar_c = _make_progress_bar(filename, total_c) if total_c else None
+    _prog_c = _make_progress_cb(filename, total_c, bar_c)
+    try:
+        await client.download_media(comment, file=dest, progress_callback=_prog_c)
+        if bar_c:
+            bar_c.close()
+    except FileReferenceExpiredError:
+        if bar_c:
+            bar_c.close()
+        refreshed = await client.get_messages(discussion_id, ids=comment.id)
+        await client.download_media(refreshed, file=dest)
+    size = (folder / filename).stat().st_size if (folder / filename).exists() else 0
+    sender = comment.sender
+    source = f"@{sender.username}" if sender and getattr(sender, "username", None) else "unknown"
+    log.info("Downloaded from comment: %s (%s)", filename, source)
+    return {"name": filename, "size": size, "source": source}
+
+
 async def download_comment_files(
-    client: TelegramClient, discussion_id: int | None, post_id: int, folder: Path
+    client: TelegramClient,
+    discussion_id: int | None,
+    post_id: int,
+    folder: Path,
+    channel=None,
 ) -> list[dict]:
-    """Download all files from post comments. Returns list of file metadata dicts."""
+    """Download all files from post comments (including nested replies and channel first-comments).
+    Returns list of file metadata dicts."""
     if not discussion_id:
         return []
     downloaded = []
-    try:
-        async for comment in client.iter_messages(discussion_id, reply_to=post_id):
-            if not comment.media:
-                continue
-            if SKIP_VIDEO and _is_skip_media(comment):
-                log.info("Skipping video in comment %d", comment.id)
-                continue
-            filename = get_media_filename(comment)
-            if not filename:
-                if comment.photo:
-                    filename = f"photo_{comment.id}.jpg"
-                elif comment.document:
-                    filename = f"document_{comment.id}.bin"
-                else:
-                    continue
-            filename = safe_filename(filename, folder, comment.id)
-            dest = str(folder / filename)
-            total_c = getattr(getattr(comment, "document", None), "size", 0) or 0
-            bar_c = _make_progress_bar(filename, total_c) if total_c else None
-            _prog_c = _make_progress_cb(filename, total_c, bar_c)
+    seen_msg_ids: set[int] = set()
 
-            try:
-                await client.download_media(comment, file=dest, progress_callback=_prog_c)
-                if bar_c:
-                    bar_c.close()
-            except FileReferenceExpiredError:
-                if bar_c:
-                    bar_c.close()
-                refreshed = await client.get_messages(discussion_id, ids=comment.id)
-                await client.download_media(refreshed, file=dest)
-            size = (folder / filename).stat().st_size if (folder / filename).exists() else 0
-            sender = comment.sender
-            source = f"@{sender.username}" if sender and getattr(sender, "username", None) else "unknown"
-            downloaded.append({"name": filename, "size": size, "source": source})
-            log.info("Downloaded from comment: %s (%s)", filename, source)
-    except Exception as e:
-        log.error("Failed to fetch comments for post %d: %s", post_id, e)
+    async def process_replies(reply_to_id: int, depth: int = 0) -> None:
+        """Рекурсивно обходим тред комментариев до глубины 3."""
+        if depth > 3:
+            return
+        try:
+            async for comment in client.iter_messages(discussion_id, reply_to=reply_to_id):
+                if comment.id in seen_msg_ids:
+                    continue
+                seen_msg_ids.add(comment.id)
+                meta = await _download_one_comment(client, comment, folder, discussion_id)
+                if meta:
+                    downloaded.append(meta)
+                sub_count = getattr(getattr(comment, "replies", None), "replies", 0) or 0
+                if sub_count > 0:
+                    await process_replies(comment.id, depth + 1)
+        except Exception as e:
+            if depth == 0:
+                log.error("Failed to fetch comments for post %d: %s", post_id, e)
+
+    # первый проход: пользовательские ответы через GetRepliesRequest
+    await process_replies(post_id)
+
+    # второй проход: «первый комментарий» от имени канала
+    # Админ канала постит файлы с reply_to=<disc_header_id>, а не reply_to=<channel_post_id>,
+    # поэтому GetRepliesRequest их не видит. Находим заголовок треда и сканируем соседние сообщения.
+    if channel is not None:
+        try:
+            result = await client(GetDiscussionMessageRequest(peer=channel, msg_id=post_id))
+            if result.messages:
+                disc_header_id = result.messages[0].id
+                log.debug("Discussion header for post %d: disc_id=%d", post_id, disc_header_id)
+                # сканируем ~50 сообщений ПОСЛЕ заголовка дискуссии (oldest first)
+                async for msg in client.iter_messages(
+                    discussion_id,
+                    min_id=disc_header_id,
+                    max_id=disc_header_id + 51,
+                    limit=50,
+                    reverse=True,
+                ):
+                    if msg.id in seen_msg_ids:
+                        continue
+                    # только документы — фото из GetReplies уже обработаны
+                    if not msg.document:
+                        continue
+                    seen_msg_ids.add(msg.id)
+                    meta = await _download_one_comment(client, msg, folder, discussion_id)
+                    if meta:
+                        downloaded.append(meta)
+        except Exception as e:
+            log.warning("Could not fetch discussion header for post %d: %s", post_id, e)
+
     return downloaded
 
 
 async def process_post(
     client: TelegramClient,
-    message,
+    messages: list,
     index: int,
     discussion_id: int | None,
     downloads_dir: Path,
     index_path: Path,
+    channel=None,
 ) -> None:
-    """Process one post: create folder, download media, save post.md."""
-    slug = make_slug(message.text)
-    date_str = message.date.strftime("%Y-%m-%d")
+    """Process one post (single message or media group): create folder, download media, save post.md."""
+    # основное сообщение: то, что содержит текст, иначе первое в группе
+    main_msg = next((m for m in messages if m.text), messages[0])
+
+    slug = make_slug(main_msg.text)
+    date_str = main_msg.date.strftime("%Y-%m-%d")
     folder_name = f"{index:04d}_{date_str}_{slug}"
     folder = downloads_dir / folder_name
 
@@ -301,45 +365,52 @@ async def process_post(
         return
 
     folder.mkdir(parents=True, exist_ok=True)
-    log.info("Processing post #%04d: %s", index, folder_name)
+    if len(messages) > 1:
+        log.info("Processing post #%04d (group of %d): %s", index, len(messages), folder_name)
+    else:
+        log.info("Processing post #%04d: %s", index, folder_name)
 
-    # download post media
-    post_file = await download_post_media(client, message, folder)
+    # скачиваем медиа из всех сообщений группы
+    post_files = []
+    for msg in messages:
+        f = await download_post_media(client, msg, folder)
+        if f:
+            post_files.append(f)
 
-    # download comment attachments
-    comment_files = await download_comment_files(client, discussion_id, message.id, folder)
+    # комментарии запрашиваем только к главному сообщению (с текстом)
+    comment_files = await download_comment_files(client, discussion_id, main_msg.id, folder, channel=channel)
 
-    # extract links
-    links = extract_links(message)
+    # извлекаем ссылки из текста
+    links = extract_links(main_msg)
 
-    # build file list for post.md
+    # итоговый список файлов для post.md
     all_files = []
-    if post_file:
-        size = (folder / post_file).stat().st_size if (folder / post_file).exists() else 0
-        all_files.append({"name": post_file, "size": size, "source": "post"})
+    for fname in post_files:
+        size = (folder / fname).stat().st_size if (folder / fname).exists() else 0
+        all_files.append({"name": fname, "size": size, "source": "post"})
     all_files.extend(comment_files)
 
-    # save post.md
+    # сохраняем post.md
     md_content = format_post_md(
         index=index,
-        post_id=message.id,
-        date=message.date,
-        views=getattr(message, "views", 0) or 0,
-        text=message.text or "",
+        post_id=main_msg.id,
+        date=main_msg.date,
+        views=getattr(main_msg, "views", 0) or 0,
+        text=main_msg.text or "",
         links=links,
         files=all_files,
     )
     (folder / "post.md").write_text(md_content, encoding="utf-8")
 
-    # update index.json
+    # обновляем index.json
     update_index(index_path, {
         "index": index,
-        "post_id": message.id,
+        "post_id": main_msg.id,
         "date": date_str,
         "slug": slug,
         "folder": str(folder),
         "file_count": len(all_files),
-        "has_text": bool(message.text),
+        "has_text": bool(main_msg.text),
     })
 
 
@@ -386,27 +457,61 @@ async def main() -> None:
         except Exception as e:
             log.warning("Could not get linked chat: %s", e)
 
-        # iterate posts oldest to newest
+        # iterate posts oldest to newest, grouping media albums
         index = 0
-        async for message in client.iter_messages(channel, reverse=True):
-            if not (message.text or message.media):
-                continue  # skip service messages
+        pending_group: list = []       # накапливаем сообщения одной медиагруппы
+        pending_group_id: int | None = None
+
+        async def flush_group() -> bool:
+            """Обработать накопленную группу. Возвращает False при ChannelPrivateError."""
+            nonlocal index
             index += 1
             try:
-                await process_post(client, message, index, discussion_id, channel_dir, index_path)
+                await process_post(client, pending_group, index, discussion_id, channel_dir, index_path, channel=channel)
             except ChannelPrivateError:
                 log.error("Channel access denied — subscription expired?")
-                break
+                return False
             except FloodWaitError as e:
                 log.warning("FloodWait: sleeping %d seconds...", e.seconds)
                 await asyncio.sleep(e.seconds)
-                index -= 1  # retry this post
-                continue
+                index -= 1
+                # повторяем обработку накопленной группы
+                await process_post(client, pending_group, index + 1, discussion_id, channel_dir, index_path, channel=channel)
+                index += 1
             except Exception as e:
-                log.error("Error processing post %d: %s", message.id, e)
-
-            # rate limiting pause
+                log.error("Error processing post %d: %s", pending_group[0].id, e)
             await asyncio.sleep(random.uniform(0.5, 1.0))
+            return True
+
+        async for message in client.iter_messages(channel, reverse=True):
+            if not (message.text or message.media):
+                continue  # пропускаем служебные сообщения
+
+            gid = message.grouped_id  # None для одиночных постов
+
+            if gid is not None and gid == pending_group_id:
+                # продолжение текущей медиагруппы
+                pending_group.append(message)
+            else:
+                # новое сообщение — сначала сбрасываем накопленное
+                if pending_group:
+                    if not await flush_group():
+                        break
+                    pending_group = []
+
+                pending_group_id = gid
+                pending_group = [message]
+
+                # одиночное сообщение (без grouped_id) обрабатываем сразу
+                if gid is None:
+                    if not await flush_group():
+                        break
+                    pending_group = []
+                    pending_group_id = None
+
+        # обработать последнюю группу, если осталась
+        if pending_group:
+            await flush_group()
 
         log.info("Done! Posts downloaded: %d", index)
     finally:
